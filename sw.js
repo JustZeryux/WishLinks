@@ -1,6 +1,6 @@
-/* WishLinks 7 service worker: caches only public static app shell.
+/* WishLinks 8 service worker: caches only public static app shell.
    Never cache /rest, /auth, /storage, tokens, or account-scoped content. */
-const CACHE='wishlinks-v7-static-2026-10-29';
+const CACHE='wishlinks-v8-static-2026-10-29';
 const ASSETS=['/','/index.html','/style.css','/app.js','/data.js','/brands.js','/cloud.js','/config.js','/motion.js','/experience.js','/manifest.webmanifest','/icons/192.png','/icons/512.png'];
 self.addEventListener('install',event=>{event.waitUntil(caches.open(CACHE).then(cache=>cache.addAll(ASSETS)).then(()=>self.skipWaiting()));});
 self.addEventListener('activate',event=>{event.waitUntil((async()=>{await Promise.all((await caches.keys()).filter(key=>key!==CACHE).map(key=>caches.delete(key)));await self.clients.claim()})());});

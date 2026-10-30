@@ -7,6 +7,7 @@ try{authSession=JSON.parse(localStorage.getItem(sessionKey))||null;}catch{}
 export function currentUser(){return authSession?.user||null;}
 export function logout(){authSession=null;localStorage.removeItem(sessionKey);}
 function saveSession(obj){authSession=obj;localStorage.setItem(sessionKey,JSON.stringify(obj));}
+export function isRecoveryLink(){return location.hash.includes('type=recovery') || sessionStorage.getItem('wishlinks-recovery')==='1';}
 const root=CONFIG.SUPABASE_URL?.replace(/\/$/,'');
 function keyHeaders(){return {'apikey':CONFIG.SUPABASE_ANON_KEY}}
 async function api(path,{method='GET',body,privateAuth=true,binary=false,keepalive=false}={}){
@@ -14,7 +15,7 @@ async function api(path,{method='GET',body,privateAuth=true,binary=false,keepali
  if(privateAuth && authSession && authSession.expires_at && Date.now()/1000 > authSession.expires_at-50)await refreshSession();
  const headers={...keyHeaders()};
  if(privateAuth && authSession?.access_token)headers.Authorization='Bearer '+authSession.access_token;
- else headers.Authorization='Bearer '+CONFIG.SUPABASE_ANON_KEY;
+ // Una publishable key no es JWT: enviarla solo en apikey (no Bearer).
  if(!binary) headers['Content-Type']='application/json';else if(body instanceof Blob)headers['Content-Type']=body.type||'application/octet-stream';
  if(path.startsWith('/rest/v1/pages')&&method!=='GET')headers['Prefer']='resolution=merge-duplicates,return=representation';
  const res=await fetch(root+path,{method,headers,body:body?binary?body:JSON.stringify(body):undefined,keepalive});
@@ -24,8 +25,9 @@ async function api(path,{method='GET',body,privateAuth=true,binary=false,keepali
 }
 async function refreshSession(){
  if(!authSession?.refresh_token)return logout();
- const data=await fetch(root+'/auth/v1/token?grant_type=refresh_token',{method:'POST',headers:{...keyHeaders(),'Content-Type':'application/json'},body:JSON.stringify({refresh_token:authSession.refresh_token})}).then(r=>r.json());
- if(!data.access_token){logout();throw Error('Tu sesión venció. Inicia sesión nuevamente.');}
+ const response=await fetch(root+'/auth/v1/token?grant_type=refresh_token',{method:'POST',headers:{...keyHeaders(),'Content-Type':'application/json'},body:JSON.stringify({refresh_token:authSession.refresh_token})});
+ const data=await response.json().catch(()=>({}));
+ if(!response.ok || !data.access_token){logout();throw Error('Tu sesión venció. Inicia sesión nuevamente.');}
  saveSession({...data,expires_at:Math.floor(Date.now()/1000)+data.expires_in});
 }
 export async function login(email,password){
@@ -43,8 +45,26 @@ export function recoverHashSession(){
    const access_token=h.get('access_token'),refresh_token=h.get('refresh_token');
    const jwt=access_token.split('.')[1];let user=null;try{const x=JSON.parse(atob(jwt.replace(/-/g,'+').replace(/_/g,'/')));user={id:x.sub,email:x.email};}catch{}
    saveSession({access_token,refresh_token,user,expires_at:Math.floor(Date.now()/1000)+Number(h.get('expires_in')||3600)});
-   history.replaceState({},'',location.pathname);
+   if(h.get('type')==='recovery')sessionStorage.setItem('wishlinks-recovery','1');
+   history.replaceState({},'',location.pathname+location.search);
  }
+}
+export async function requestPasswordReset(email){
+ if(!/^\S+@\S+\.\S+$/.test(email))throw Error('Escribe un correo válido.');
+ await api('/auth/v1/recover?redirect_to='+encodeURIComponent(location.origin+'/studio'),{method:'POST',body:{email},privateAuth:false});
+ return true; // Always show neutral message; do not reveal account existence.
+}
+export async function resendVerification(email){
+ if(!/^\S+@\S+\.\S+$/.test(email))throw Error('Escribe un correo válido.');
+ await api('/auth/v1/resend',{method:'POST',body:{email,type:'signup'},privateAuth:false});
+ return true;
+}
+export async function changePassword(password){
+ if(!currentUser())throw Error('El enlace de recuperación caducó. Pide uno nuevo.');
+ if(typeof password!=='string'||password.length<10)throw Error('La contraseña debe tener al menos 10 caracteres.');
+ await api('/auth/v1/user',{method:'PUT',body:{password}});
+ sessionStorage.removeItem('wishlinks-recovery');
+ return true;
 }
 export async function ownerPages(){
  const user=currentUser();if(!user)throw Error('Inicia sesión.');
@@ -53,6 +73,7 @@ export async function ownerPages(){
 export async function saveRemote(page){
  const user=currentUser();if(!user)throw Error('Inicia sesión.');
  if(!validSlug(page.slug))throw Error('URL inválida. Usa de 3 a 30 letras, números, guiones o guiones bajos.');
+ if(!page.id || !/^[0-9a-f-]{36}$/i.test(page.id))throw Error('ID de página inválido.');
  const obj={id:page.id,user_id:user.id,slug:page.slug.toLowerCase(),title:page.title,description:page.description,avatar_url:page.avatar_url||'',cover_url:page.cover_url||'',tag:page.tag||'',theme:page.theme,settings:page.settings,socials:page.socials,blocks:page.blocks,is_published:Boolean(page.is_published),updated_at:new Date().toISOString()};
  try{const existing=Boolean(page.created_at);const url=existing?'/rest/v1/pages?id=eq.'+encodeURIComponent(page.id):'/rest/v1/pages';const method=existing?'PATCH':'POST';if(existing){delete obj.id;delete obj.user_id;}const data=await api(url,{method,body:obj});if(!Array.isArray(data)||!data[0])throw Error('No se pudo confirmar el guardado de esta página.');return normalizePage(data[0]);}
  catch(e){if(/page_limit_reached|maximum_two_pages|wishlinks_limit_2/i.test(e.message))throw Error('Tu cuenta ya tiene dos páginas. Puedes editarlas o eliminar una antes de crear otra.');if(/duplicate|unique|23505/i.test(e.message))throw Error('Ese nombre de usuario ya está ocupado. Elige otro.');throw e;}
@@ -71,13 +92,25 @@ export async function deleteDraftSnapshot(id){
  return api('/rest/v1/page_drafts?id=eq.'+encodeURIComponent(id)+'&user_id=eq.'+encodeURIComponent(user.id),{method:'DELETE'});
 }
 export async function deleteRemote(id){await api('/rest/v1/pages?id=eq.'+encodeURIComponent(id),{method:'DELETE'});}
+export async function publishRemote(pageId){
+ if(!currentUser())throw Error('Debes iniciar sesión para publicar.');
+ await api('/rest/v1/rpc/wishlinks_publish_page',{method:'POST',body:{p_page:pageId}});
+ return true;
+}
+export async function unpublishRemote(pageId){
+ if(!currentUser())throw Error('Debes iniciar sesión para retirar la página.');
+ await api('/rest/v1/rpc/wishlinks_unpublish_page',{method:'POST',body:{p_page:pageId}});
+ return true;
+}
 export async function fetchPublicPage(slug){
  if(!cloudEnabled)return null;
- const data=await api(`/rest/v1/pages?select=*&slug=eq.${encodeURIComponent(slug)}&is_published=eq.true&limit=1`,{privateAuth:false});
+ if(!validSlug(slug))return null;
+ const data=await api(`/rest/v1/published_pages?select=*&slug=eq.${encodeURIComponent(slug.toLowerCase())}&is_published=eq.true&limit=1`,{privateAuth:false});
  return data[0]?normalizePage(data[0]):null;
 }
-export function trackView(id){return api('/rest/v1/rpc/wishlinks_track_view',{method:'POST',body:{p_page:id},privateAuth:false,keepalive:true}).catch(()=>{});}
-export function trackClick(id,blockId){return api('/rest/v1/rpc/wishlinks_track_click',{method:'POST',body:{p_page:id,p_block:blockId},privateAuth:false,keepalive:true}).catch(()=>{});}
+// Public counters are disabled until a trusted, rate-limited endpoint is deployed.
+export function trackView(_id){return Promise.resolve();}
+export function trackClick(_id,_blockId){return Promise.resolve();}
 export async function uploadAsset(file){
  const user=currentUser();if(!user)throw Error('Inicia sesión para subir imágenes.');
  if(file.size>5*1024*1024)throw Error('Límite 5MB.');
